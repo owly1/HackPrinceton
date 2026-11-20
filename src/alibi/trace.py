@@ -29,7 +29,7 @@ from __future__ import annotations
 from typing import Any
 
 TRACE_VERSION = "trace/2"
-EXAMINATION_TOOLS = ("check_", "search_events", "get_events", "count_events")
+EXAMINATION_TOOLS = ("check_", "search_events", "get_events", "count_events", "follow_export_output")
 UNNAMED_FINISH = "unnamed finish event"
 NOT_FINISHED = "not finished in the log"
 REWORDING_OVERLAP = 0.5

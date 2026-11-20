@@ -113,7 +113,7 @@ Call the checks in parallel and answer in at most two turns. Keep each reason un
 
 {_RULES}"""
 
-LAB_LEAD_PROMPT_VERSION = "lab-lead/5"  # 2: first look delegated, narrow searches. 3-4: plan updated on a lead. 5: worker link
+LAB_LEAD_PROMPT_VERSION = "lab-lead/6"  # 2: first look delegated, narrow searches. 3-4: plan updates. 5: worker link. 6: follow export output
 # Worker-lab cases, three-agent mode. Not a fixed order of steps: what is examined next depends on what the
 # evidence just showed. The clinic prompts above are unchanged, so the evaluation's prompt fingerprints still hold.
 LAB_LEAD_PROMPT = f"""You are the lead investigator on a frozen evidence bundle from a simulated lab in which automated
@@ -136,6 +136,10 @@ tools, and reading the logs yourself is not a substitute. Its answer is short.
 When its answer comes back, your next turn must include write_todos with the updated plan: the finished steps
 marked completed and one new item for each conflict it reported, naming the record or the transfer. A plan that
 stays the same after new evidence is a mistake.
+
+If the auditor finds a collector-retained export missing locally, use follow_export_output on its
+collector_event_id. Cite the originating record and any matching file metadata in case.md. If the path or
+metadata is missing, keep the file question open. A path match alone cannot establish file contents.
 
 Then repeat until the open leads are settled or you are running out of requests:
 - Decide what to examine next from what you just learned.
@@ -310,7 +314,13 @@ def family_addendum(toolbox: CaseToolbox) -> str:
     """Extra prompt text for a bundle of the remaining case families. Empty for a first-run bundle, whose
     prompts therefore stay exactly as they were."""
     if "lab" in toolbox.manifest.operational_context:
-        return ("\n\n" + LAB_CHECKS_NOTE) if toolbox.checks_enabled else ""
+        if not toolbox.checks_enabled:
+            return ""
+        note = "\n\n" + LAB_CHECKS_NOTE
+        if toolbox.verify_on_submit:
+            note += (" When an export record raises a lead about a file, call follow_export_output with its event ID. "
+                     "Record the cited path match or the coverage limit in the case notes.")
+        return note
     if not toolbox.family:
         return ""
     return "\n\n" + FAMILY_VOCABULARY + "\n\n" + (FAMILY_CHECKS_NOTE if toolbox.checks_enabled else FAMILY_GENERIC_NOTE)

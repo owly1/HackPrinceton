@@ -333,6 +333,41 @@ class CaseToolbox:
         return ({"events": [self._row(e) for e in rows], "not_found": [i for i in ids if i not in found]},
                 f"{len(rows)} of {len(ids)} id(s) resolved", [e.id for e in rows])
 
+    def follow_export_output(self, event_id: str) -> tuple[dict[str, Any], str, list[str]]:
+        rows = self.store.get([event_id])
+        if not rows:
+            raise ValueError("event id not found in this bundle")
+        ev = rows[0]
+        forwarded_app = ev.source == "collector" and ev.attrs.get("inner_source") == "app"
+        if ev.action != "export_bulk" or not (ev.source == "app" or forwarded_app):
+            raise ValueError("expected an application export record or its forwarded copy")
+        host = ev.attrs["origin_host"] if forwarded_app else ev.host
+        line = ev.attrs["inner_raw"] if forwarded_app else ev.raw
+        # Older frozen databases keep the output path only in the original application line.
+        paths = re.findall(r"(?:^|\s)out=(\S+)", line)
+        result = {"export_event_id": ev.id, "host": host}
+        if len(paths) != 1:
+            note = f"The output of export {ev.id} remains unconfirmed because the record gives no unique output path."
+            return {**result, "status": "no_unique_output_path", "observation": note}, note, [ev.id]
+        path = paths[0]
+        filters = dict(source="fs_stat", host=host, action="file_stat", object=path)
+        matches = self.store.search(**filters, limit=5)
+        if matches:
+            status = "path_observed"
+            summary = "File metadata records the export path"
+            note = (f"Export {ev.id} names {path}. The host snapshot records that path "
+                    f"({matches[0].id}). Its contents are unknown.")
+        elif any(s.host == host and s.source == "fs_stat" for s in self.manifest.sources):
+            status = "path_unobserved"
+            summary = "No matching path in the captured file metadata"
+            note = f"The output of export {ev.id} remains unconfirmed. The host snapshot has no entry for {path}."
+        else:
+            status = "source_unavailable"
+            summary = "No file metadata source for the exporting host"
+            note = f"The output of export {ev.id} remains unconfirmed. This evidence view has no file metadata for {host}."
+        return ({**result, "path": path, "status": status, "observation": note, "total_matching": self.store.count(**filters),
+                 "events": [self._row(m) for m in matches]}, summary, [ev.id, *(m.id for m in matches)])
+
     def check_local_vs_collector(self, host: str | None, file: str | None) -> tuple[dict[str, Any], str, list[str]]:
         from alibi.runners import summarize_reconcile
 
@@ -466,6 +501,8 @@ class CaseToolbox:
         if self.family and holds_checks:
             names += tuple(FAMILY_CHECK_TOOLS)
         lab = "lab" in self.manifest.operational_context
+        if lab and self.checks_enabled and self.verify_on_submit:
+            names += ("follow_export_output",)
         if lab and holds_checks:
             names += ("check_job_assignments",)
         tb = self
@@ -504,6 +541,12 @@ class CaseToolbox:
         def get_events(ids: list[str]) -> str:
             """Fetch evidence events by id (at most 50)."""
             return tb._run(role, "get_events", {"ids": ids}, lambda: tb.get_events(ids))
+
+        def follow_export_output(event_id: str) -> str:
+            """Follow an export_bulk event's out= path into the originating host's frozen file metadata.
+            Returns exact path matches and their event IDs. A match does not establish file contents,
+            and a missing path does not establish deletion."""
+            return tb._run(role, "follow_export_output", {"event_id": event_id}, lambda: tb.follow_export_output(event_id))
 
         def check_local_vs_collector(host: str | None = None, file: str | None = None) -> str:
             """Deterministic check. Compare each host-local log with the collector's copies, aware of log rotation
@@ -643,7 +686,7 @@ class CaseToolbox:
                                              check_record_exports, check_cross_host_sessions, check_forwarding,
                                              check_file_times, check_shell_history, check_sensor_streams,
                                              submit_finding, record_skeptic_verdict, submit_attribution, finalize_report,
-                                             check_job_assignments)}
+                                             check_job_assignments, follow_export_output)}
         if lab:  # a worker-lab bundle: the attribution may carry a worker link. Every other bundle keeps its schema
             available["submit_attribution"] = submit_attribution_lab
         out = [StructuredTool.from_function(available[n], name=n) for n in names]

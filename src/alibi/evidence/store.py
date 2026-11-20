@@ -117,7 +117,7 @@ class EvidenceStore:
         clauses: list[str] = []
         params: list[Any] = []
         for col in ("source", "host", "actor", "action", "origin_host", "origin_file", "session_id",
-                    "logical_file", "artifact"):
+                    "logical_file", "artifact", "object"):
             val = filters.get(col)
             if val is None:
                 continue

@@ -325,7 +325,7 @@ def _submitted_types(messages: list[BaseMessage]) -> set[str]:
 
 
 def lab_single_policy(messages: list[BaseMessage], bound: tuple[str, ...] = ()) -> AIMessage:
-    """Fast investigation of a worker-lab bundle, one step per request, in a fixed order.
+    """Fast investigation of a worker-lab bundle, with a bounded follow-up on the first unexplained export gap.
 
     Each turn below is one request against the run's allowance: the brief; the local-vs-collector comparison;
     recording what it shows; the transfer correlation; recording the transfers; the staged exports and the
@@ -346,10 +346,27 @@ def lab_single_policy(messages: list[BaseMessage], bound: tuple[str, ...] = ()) 
     from alibi.runners import lab_removal_findings
 
     rec_found = lab_removal_findings(rec, produced_by=role) if _usable(rec, "files") else []
+    # Pick a lead from the returned evidence. Routine activity and retention-explained gaps do not trigger it.
+    lead = next((row["collector_event_id"] for file in rec.get("files", [])
+                 for row in file["unexplained_local_absence"] if row["action"] == "export_bulk"), None)
+    follow = lead is not None and "follow_export_output" in bound
+    plan = list(_LAB_TODOS)
+    if follow:
+        plan.insert(2, f"Look up the output path recorded by export {lead}")
+
+    def current_step(original_index: int) -> dict[str, Any]:
+        index = plan.index(_LAB_TODOS[original_index])
+        return _todos(index, index, plan)
+
+    calls = []
     if rec_found and not done & {f.claim_type for f in rec_found}:
-        return _ai(role, messages, [("submit_finding", _finding_args(f.model_dump(mode="json"))) for f in rec_found])
+        calls.extend(("submit_finding", _finding_args(f.model_dump(mode="json"))) for f in rec_found)
+    if follow and "follow_export_output" not in called:
+        calls.extend([("write_todos", _todos(2, 2, plan)), ("follow_export_output", {"event_id": lead})])
+    if calls:
+        return _ai(role, messages, calls)
     if "check_transfer_sessions" not in called:
-        return _ai(role, messages, [("write_todos", _todos(2, 2, _LAB_TODOS)), ("check_transfer_sessions", {})])
+        return _ai(role, messages, [("write_todos", current_step(2)), ("check_transfer_sessions", {})])
     xfer = (_results(messages, "check_transfer_sessions") or [{}])[0]
     x_found = baselines.findings_from_transfers(xfer, produced_by=role) if _usable(xfer, "transfers") else []
     moved = [f for f in x_found if f.claim_type != "data_staging"]
@@ -366,7 +383,7 @@ def lab_single_policy(messages: list[BaseMessage], bound: tuple[str, ...] = ()) 
     if step:
         return _ai(role, messages, step)
     if "check_job_assignments" not in called:
-        return _ai(role, messages, [("write_todos", _todos(4, 4, _LAB_TODOS)), ("check_job_assignments", {})])
+        return _ai(role, messages, [("write_todos", current_step(4)), ("check_job_assignments", {})])
     more = _family_calls(role, messages, bound)
     if more is not None:
         return more
@@ -381,20 +398,28 @@ def lab_single_policy(messages: list[BaseMessage], bound: tuple[str, ...] = ()) 
             pass
     candidates = [c.model_dump(mode="json") for c in found]
     n_inc = sum(c["category"] == "incident_allegation" for c in candidates)
+    follow_results = _results(messages, "follow_export_output")
+    follow_note = ""
+    if follow_results:
+        follow_note = follow_results[0].get("observation", f"The output lookup for export {lead} did not complete.")
     if "submit_attribution" not in called:
         lines = ["# Case notes (scripted fixture, single agent, worker lab)", "",
                  f"The checks produced {len(candidates)} candidate(s); {n_inc} incident allegation(s).", ""]
         lines += [f"- [{c['category']}] {c['claim_type']} on {c['host']} ({c.get('object_or_session')}): "
                   f"{len(c['evidence_ids'])} cited record(s)" for c in candidates]
+        if follow_note:
+            lines.append(follow_note)
         att = {k: v for k, v in attribution.model_dump(mode="json").items()
                if k in ("statement", "account_used", "human_identity", "session_ref", "supporting_evidence_ids",
                         "contrary_evidence_ids", "limits", "assumptions") and v not in (None, [], "")}
         return _ai(role, messages, [("write_file", {"file_path": "/case/notes.md", "content": "\n".join(lines) + "\n"}),
-                                    ("write_todos", _todos(6, 6, _LAB_TODOS)), ("submit_attribution", att)])
+                                    ("write_todos", current_step(6)), ("submit_attribution", att)])
     if "finalize_report" not in called:
         limits = _limits(rec, xfer, {})
         summary = (f"{n_inc} incident allegation(s), {len(candidates) - n_inc} benign explanation(s)/open note(s). "
                    + attribution.statement + (_UNKNOWN if limits else ""))
+        if follow_note:
+            summary += " " + follow_note
         questions = ["Who had access to the credential used in the linked session?"] if n_inc else []
         questions += [f"Coverage limit: {x}"[:300] for x in limits]
         return _ai(role, messages, [("finalize_report", {"summary": summary, "open_questions": questions[:8]})])

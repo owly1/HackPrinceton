@@ -1063,3 +1063,66 @@ def test_a_smaller_investigator_allowance_establishes_less_and_stops(env):
     assert out[2][0] < out[16][0]
     assert out[2][1] == "stopped" and any(q.startswith("Incomplete run: stopped at its request allowance") for q in out[2][2])
     assert out[16][1] == "complete"
+
+
+@pytest.mark.parametrize(("variant", "permissions", "expected"), [
+    ("incident", "export_log", "File metadata records the export path"),
+    ("incident", "export_log_artifact", "No matching path in the captured file metadata"),
+    ("control", "export_log", None),
+])
+def test_follow_export_from_collector_gap(env, variant, permissions, expected):
+    _, orch, client, _ = env
+    cid = _create(client, variant=variant, rogue_permissions=permissions, runner="agent-fixture",
+                  investigation_mode="fast", investigator_requests=16)["case"]["case_id"]
+    _wait(client, cid)
+    events = client.get(f"/api/cases/{cid}/events.json").json()["events"]
+    followups = [e["data"] for e in events if e["data"].get("tool") == "follow_export_output"]
+    report = client.get(f"/api/cases/{cid}").json()["report"]
+    if expected is None:
+        assert not followups
+        assert not any(f["category"] == "incident_allegation" for f in report["findings"])
+        return
+    [followup] = followups
+    assert followup["result_summary"] == expected
+    anchor_id = followup["args"]["event_id"]
+    trace = client.get(f"/api/cases/{cid}/trace").json()
+    assert any(anchor_id in item for version in trace["behaviors"]["plan_revisions"] for item in version["added_new"])
+    assert anchor_id in report["summary"]
+    with EvidenceStore(orch._paths(cid).db) as store:
+        anchor, *matches = store.get(followup["evidence_ids"])
+        assert anchor.id == anchor_id and anchor.source == "collector" and anchor.action == "export_bulk"
+        if permissions == "export_log":
+            [match] = matches
+            assert match.id in report["summary"]
+            assert match.source == "fs_stat" and match.host == anchor.attrs["origin_host"]
+            assert f"out={match.object}" in anchor.attrs["inner_raw"].split()
+        else:
+            assert not matches and "remains unconfirmed" in report["summary"]
+    assert client.post(f"/api/cases/{cid}/reveal").status_code == 409
+
+
+def test_export_lookup_uses_only_the_available_snapshot(env):
+    from alibi.agents.tools import CaseToolbox
+    from alibi.source_experiment import create_child_bundle
+
+    settings, orch, _, _ = env
+    _, paths, manifest = _lab_case(orch)
+    with EvidenceStore(paths.db) as store:
+        box = CaseToolbox(store, manifest)
+        tool = next(t for t in box.tools_for("lead-investigator") if t.name == "follow_export_output")
+        assert "error" in json.loads(tool.invoke({"event_id": "missing-id"}))
+        ingest = store.search(source="app", action="ingest", limit=1)[0]
+        assert "error" in json.loads(tool.invoke({"event_id": ingest.id}))
+
+        export = store.search(source="collector", action="export_bulk", limit=1)[0]
+
+    child = episode_paths("without-file-metadata", settings.runs_dir, settings.sealed_dir)
+    withheld = [s.source_id for s in manifest.sources if s.source == "fs_stat"]
+    reduced_manifest = create_child_bundle(paths, child, withheld)
+    with EvidenceStore(child.db) as reduced_store:
+        reduced_box = CaseToolbox(reduced_store, reduced_manifest)
+        result, _, ids = reduced_box.follow_export_output(export.id)
+        assert result["status"] == "source_unavailable" and ids == [export.id]
+        assert result["host"] == export.attrs["origin_host"]
+        baseline = CaseToolbox(reduced_store, reduced_manifest, verify_on_submit=False)
+        assert "follow_export_output" not in {t.name for t in baseline.tools_for("single-agent")}
